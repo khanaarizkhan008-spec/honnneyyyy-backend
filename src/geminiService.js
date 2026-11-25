@@ -13,6 +13,7 @@ VOICE & TONE RULES (STRICT):
 - Speak like a caring, street-smart best friend ("bestie", warm, witty, protective, zero judgment).
 - NEVER use clinical or robotic cybersecurity words like "Analyze", "Detection Engine", "Severity Level", "User Input", "Execute", or "OCR Processing".
 - Never shame the user. Make them feel smart for checking the receipts with you.
+- Give a fresh, specific, original take tailored to the exact words in this message—never repeat generic boilerplate.
 
 Return ONLY valid JSON matching this exact schema:
 {
@@ -39,15 +40,17 @@ Return ONLY valid JSON matching this exact schema:
 Include 2 to 4 items in flagged_phrases and 2 to 3 items in sugared_vs_raw (even for low-risk messages, give honest perspective).`;
 
 function getModelCandidates(runtimeEnv) {
-  const customModel = runtimeEnv?.GEMINI_MODEL ?? (typeof process !== 'undefined' ? process.env?.GEMINI_MODEL : undefined);
+  const customModel =
+    runtimeEnv?.GEMINI_MODEL ??
+    (typeof process !== 'undefined' ? process.env?.GEMINI_MODEL : undefined);
   return [
     customModel,
+    'gemini-3.5-flash-lite',
     'gemini-3-flash-preview',
     'gemini-3.1-flash-lite',
-    'gemini-3.5-flash-lite',
-    'gemini-3.1-pro-preview',
     'gemini-flash-latest',
-    'gemini-flash-lite-latest',
+    'gemma-4-26b-a4b-it',
+    'gemma-4-31b-it',
   ].filter(Boolean);
 }
 
@@ -64,11 +67,43 @@ function extractJson(rawText) {
     .replace(/^```\s*/i, '')
     .replace(/\s*```$/i, '')
     .trim();
-  return JSON.parse(cleaned);
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  const jsonSlice =
+    firstBrace !== -1 && lastBrace > firstBrace
+      ? cleaned.slice(firstBrace, lastBrace + 1)
+      : cleaned;
+  return JSON.parse(jsonSlice);
 }
 
-async function callGeminiModels(apiKey, payload, runtimeEnv) {
+async function callModels(apiKey, { systemText, userText, expectJson, temperature, runtimeEnv }) {
+  const errors = [];
   for (const model of getModelCandidates(runtimeEnv)) {
+    const isGemma = model.startsWith('gemma-');
+    const body = isGemma
+      ? {
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: `${systemText}\n\n---\n\n${userText}` }],
+            },
+          ],
+          generationConfig: {
+            temperature,
+            topP: 0.95,
+          },
+        }
+      : {
+          systemInstruction: { parts: [{ text: systemText }] },
+          contents: [{ role: 'user', parts: [{ text: userText }] }],
+          safetySettings: SAFETY_SETTINGS,
+          generationConfig: {
+            ...(expectJson ? { responseMimeType: 'application/json' } : {}),
+            temperature,
+            topP: 0.95,
+          },
+        };
+
     try {
       const response = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
@@ -77,13 +112,14 @@ async function callGeminiModels(apiKey, payload, runtimeEnv) {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(body),
         }
       );
 
       if (!response.ok) {
         const errBody = await response.text();
         console.warn(`[Gemini ${model} HTTP ${response.status}]:`, errBody.slice(0, 220));
+        errors.push({ model, status: response.status, msg: errBody.slice(0, 120) });
         continue;
       }
 
@@ -92,11 +128,13 @@ async function callGeminiModels(apiKey, payload, runtimeEnv) {
       if (rawText) {
         return { rawText, model };
       }
+      errors.push({ model, status: 'empty_candidate' });
     } catch (err) {
       console.warn(`[Gemini ${model} exception]:`, err?.message || err);
+      errors.push({ model, status: 'exception', msg: String(err?.message || err).slice(0, 120) });
     }
   }
-  return null;
+  return { rawText: null, errors };
 }
 
 export async function checkMessageWithGemini(content, mode = 'paste', runtimeEnv = null) {
@@ -115,32 +153,15 @@ export async function checkMessageWithGemini(content, mode = 'paste', runtimeEnv
           ? 'text read from a private chat screenshot'
           : 'pasted DM or text message';
 
-    const result = await callGeminiModels(
-      apiKey,
-      {
-        systemInstruction: {
-          parts: [{ text: SYSTEM_PROMPT }],
-        },
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: `Bestie, look at this ${modeLabel} someone sent me:\n\n"""\n${trimmed}\n"""`,
-              },
-            ],
-          },
-        ],
-        safetySettings: SAFETY_SETTINGS,
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.55,
-        },
-      },
-      runtimeEnv
-    );
+    const result = await callModels(apiKey, {
+      systemText: SYSTEM_PROMPT,
+      userText: `Bestie, look at this ${modeLabel} someone sent me (check #${Date.now() % 997}):\n\n"""\n${trimmed}\n"""`,
+      expectJson: true,
+      temperature: 0.85,
+      runtimeEnv,
+    });
 
-    if (!result) {
+    if (!result || !result.rawText) {
       return runLocalHeuristicCheck(trimmed, mode);
     }
 
@@ -183,22 +204,13 @@ export async function askBestieRescueReply(situation, question, runtimeEnv = nul
           ? 'The user already sent money and needs calm Golden-Hour recovery guidance.'
           : 'The user is still just talking and wants a breezy, safe stalling or exit reply.';
 
-    const result = await callGeminiModels(
-      apiKey,
-      {
-        systemInstruction: {
-          parts: [
-            {
-              text: `You are Honnnneyyyy, a warm, protective best friend helping someone safely navigate a sketchy DM or sextortion/scam situation. ${situationContext} Give a short, calm, practical answer (max 3 sentences) with a copy-pasteable reply if they asked what to say. Never shame them, never tell them to pay or confront aggressively.`,
-            },
-          ],
-        },
-        contents: [{ role: 'user', parts: [{ text: cleanQ }] }],
-        safetySettings: SAFETY_SETTINGS,
-        generationConfig: { temperature: 0.6 },
-      },
-      runtimeEnv
-    );
+    const result = await callModels(apiKey, {
+      systemText: `You are Honnnneyyyy, a warm, protective best friend helping someone safely navigate a sketchy DM or sextortion/scam situation. ${situationContext} Give a short, calm, practical answer (max 3 sentences) with a fresh copy-pasteable reply if they asked what to say. Never shame them, never tell them to pay or confront aggressively.`,
+      userText: cleanQ,
+      expectJson: false,
+      temperature: 0.8,
+      runtimeEnv,
+    });
 
     return result?.rawText?.trim() || getLocalRescueReply(situation, cleanQ);
   } catch {
