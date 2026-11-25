@@ -5,6 +5,6 @@
   "compatibility_date": "2025-11-01",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    "FRONTEND_ORIGIN": "*"
+    "FRONTEND_ORIGIN": "https://honnneyyyy-frontend.vercel.app,http://localhost:5173"
   }
 }

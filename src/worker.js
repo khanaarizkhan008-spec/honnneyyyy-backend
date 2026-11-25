@@ -4,9 +4,17 @@ import {
 } from './geminiService.js';
 
 function corsHeaders(request, env) {
-  const origin = request.headers.get('Origin') || '*';
-  const configured = env.FRONTEND_ORIGIN || '*';
-  const allowOrigin = configured === '*' ? '*' : origin;
+  const origin = request.headers.get('Origin') || '';
+  const configured = (env.FRONTEND_ORIGIN || '*')
+    .split(',')
+    .map((o) => o.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+
+  const normalizedOrigin = origin.replace(/\/$/, '');
+  const allowOrigin =
+    configured.includes('*') || (normalizedOrigin && configured.includes(normalizedOrigin))
+      ? normalizedOrigin || '*'
+      : configured[0] || '*';
 
   return {
     'Access-Control-Allow-Origin': allowOrigin,
